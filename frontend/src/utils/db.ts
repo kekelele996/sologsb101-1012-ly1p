@@ -12,9 +12,11 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { InstallationRecord } from '@/types/installation';
+import { backfillInstallationsFor } from '@/utils/installation';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +38,8 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  /** 安装履历：v3 起随快照导出；早期快照缺省时按仪器现有档案补一条 */
+  installations: InstallationRecord[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +48,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  installations!: Table<InstallationRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -87,6 +92,30 @@ export class SeisArrayDatabase extends Dexie {
             });
         }
       });
+
+    // v3：新增 installations 安装履历表；旧数据按现有仪器档案（当前台站 + 当前序列号 + 安装日期）补一条履历
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        installations: 'id, instrumentId, stationId, serialNo, startDate, endDate, reason, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const [instruments, installations] = await Promise.all([
+          tx.table<Instrument, string>('instruments').toArray(),
+          tx.table<InstallationRecord, string>('installations').toArray(),
+        ]);
+        const backfilled = backfillInstallationsFor(instruments, installations, {
+          idFactory: (instrumentId) => `inst_bf_${instrumentId}`,
+        });
+        const additions = backfilled.slice(installations.length);
+        if (additions.length > 0) {
+          await tx.table<InstallationRecord, string>('installations').bulkPut(additions);
+        }
+      });
   }
 }
 
@@ -127,6 +156,18 @@ interface SeedCalibration {
   remark: string;
 }
 
+/** 播种用履历段：不带时间戳，由播种事务统一补齐 */
+interface SeedInstallation {
+  id: string;
+  stationId: string;
+  serialNo: string;
+  startDate: string;
+  endDate: string | null;
+  reason: InstallationRecord['reason'];
+  operator: string;
+  remark: string;
+}
+
 interface SeedInstrument {
   id: string;
   stationId: string;
@@ -137,6 +178,8 @@ interface SeedInstrument {
   state: Instrument['state'];
   remark: string;
   calibrations: SeedCalibration[];
+  /** 安装履历：不填则按当前档案生成一条「初次安装」在用段 */
+  installations?: SeedInstallation[];
 }
 
 interface SeedStation {
@@ -162,8 +205,11 @@ interface SeedArray {
 }
 
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
+ * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 11 条标定 + 3 条更换，
+ * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本；
+ * 安装履历刻意包含 1 次改点（ins_ltx03_bb：LTX02 → LTX03，同序列号）
+ * 与 2 次同站更换序列号（ins_hx02_bb / ins_ltx01_st，旧序列号封存在履历段），
+ * 便于演示「台站台数按当前归属、标定成果按当时归属」的对账口径。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now();
@@ -226,10 +272,32 @@ export async function seedDemoData(): Promise<void> {
               stationId: 'stn_ltx_01',
               type: '短周期',
               model: 'FSS-3B',
-              serialNo: 'FSS3B-20210418-02',
+              serialNo: 'FSS3B-20250506-24',
               installDate: '2021-04-18',
               state: '待标定',
-              remark: '备份仪器，已逾标定周期',
+              remark: '备份仪器；2025 年更换过序列号（同站），旧序列号封存在履历，已逾标定周期',
+              installations: [
+                {
+                  id: 'inst_ltx01_st_1',
+                  stationId: 'stn_ltx_01',
+                  serialNo: 'FSS3B-20210418-02',
+                  startDate: '2021-04-18',
+                  endDate: null,
+                  reason: '初次安装',
+                  operator: '周渝',
+                  remark: '初装序列号',
+                },
+                {
+                  id: 'inst_ltx01_st_2',
+                  stationId: 'stn_ltx_01',
+                  serialNo: 'FSS3B-20250506-24',
+                  startDate: '__REPLACE_60__',
+                  endDate: null,
+                  reason: '更换序列号',
+                  operator: '陈立群',
+                  remark: '超期未标定更换新型号，复核标定合格后序列号回写',
+                },
+              ],
               calibrations: [
                 {
                   id: 'cal_ltx01_st_1',
@@ -239,7 +307,7 @@ export async function seedDemoData(): Promise<void> {
                   selfNoise: 2.4,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '首次标定',
+                  remark: '首次标定（旧序列号名下）',
                 },
               ],
             },
@@ -319,7 +387,29 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'STS25-20230902-11',
               installDate: '2023-09-02',
               state: '在用',
-              remark: '新建站首台仪器',
+              remark: '2025-06-15 由 LTX02 改点至本站（同序列号），改点前标定仍挂原台站',
+              installations: [
+                {
+                  id: 'inst_ltx03_bb_1',
+                  stationId: 'stn_ltx_02',
+                  serialNo: 'STS25-20230902-11',
+                  startDate: '2023-09-02',
+                  endDate: '2025-06-14',
+                  reason: '初次安装',
+                  operator: '林之遥',
+                  remark: '原安装在 LTX02 井下台基',
+                },
+                {
+                  id: 'inst_ltx03_bb_2',
+                  stationId: 'stn_ltx_03',
+                  serialNo: 'STS25-20230902-11',
+                  startDate: '2025-06-15',
+                  endDate: null,
+                  reason: '改点',
+                  operator: '周渝',
+                  remark: 'LTX02 井下环境改造，整机改点至 LTX03',
+                },
+              ],
               calibrations: [
                 {
                   id: 'cal_ltx03_bb_1',
@@ -329,7 +419,17 @@ export async function seedDemoData(): Promise<void> {
                   selfNoise: 2.05,
                   operator: '林之遥',
                   agency: '省地震局计量站',
-                  remark: '脉冲响应合格',
+                  remark: '改点前在 LTX02 标定，脉冲响应合格，成果归原台站',
+                },
+                {
+                  id: 'cal_ltx03_bb_2',
+                  instrumentId: 'ins_ltx03_bb',
+                  date: '2025-09-08',
+                  sensitivity: 2237.6,
+                  selfNoise: 2.18,
+                  operator: '林之遥',
+                  agency: '省地震局计量站',
+                  remark: '改点至 LTX03 后复测，响应合格',
                 },
               ],
             },
@@ -426,10 +526,32 @@ export async function seedDemoData(): Promise<void> {
               stationId: 'stn_hx_02',
               type: '宽频带',
               model: 'CMG-3ESPC',
-              serialNo: 'CMG-3E-20190926-05',
+              serialNo: 'CMG-3E-20250410-33',
               installDate: '2019-09-26',
               state: '待标定',
-              remark: '夜间自噪抬升，待复标',
+              remark: '夜间自噪抬升，已完成序列号更换、待复核复标',
+              installations: [
+                {
+                  id: 'inst_hx02_bb_1',
+                  stationId: 'stn_hx_02',
+                  serialNo: 'CMG-3E-20190926-05',
+                  startDate: '2019-09-26',
+                  endDate: null,
+                  reason: '初次安装',
+                  operator: '林之遥',
+                  remark: '初装序列号',
+                },
+                {
+                  id: 'inst_hx02_bb_2',
+                  stationId: 'stn_hx_02',
+                  serialNo: 'CMG-3E-20250410-33',
+                  startDate: '__REPLACE_20__',
+                  endDate: null,
+                  reason: '更换序列号',
+                  operator: '林之遥',
+                  remark: '自噪持续超标整机更换，已安装待复核标定',
+                },
+              ],
               calibrations: [
                 {
                   id: 'cal_hx02_bb_1',
@@ -439,7 +561,7 @@ export async function seedDemoData(): Promise<void> {
                   selfNoise: 3.9,
                   operator: '林之遥',
                   agency: '国家测震台网计量中心',
-                  remark: '自噪接近上限，判定不合格',
+                  remark: '自噪接近上限，判定不合格（旧序列号名下成果）',
                 },
               ],
             },
@@ -490,7 +612,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.installations],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -501,6 +623,7 @@ export async function seedDemoData(): Promise<void> {
       const stationRows: SeisStation[] = [];
       const instrumentRows: Instrument[] = [];
       const calibrationRows: Calibration[] = [];
+      const installationRows: InstallationRecord[] = [];
 
       arrays.forEach((seed, arrayIndex) => {
         const { stations, ...arrayRest } = seed;
@@ -509,10 +632,38 @@ export async function seedDemoData(): Promise<void> {
           const { instruments, ...stationRest } = stationSeed;
           stationRows.push({ ...stationRest, ...stamp(100 + arrayIndex * 100 + stationIndex) });
           instruments.forEach((instrumentSeed, instrumentIndex) => {
-            const { calibrations, ...instrumentRest } = instrumentSeed;
+            const { calibrations, installations, ...instrumentRest } = instrumentSeed;
+            const baseStamp = 200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex;
             instrumentRows.push({
               ...instrumentRest,
-              ...stamp(200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
+              ...stamp(baseStamp),
+            });
+            // 安装履历：显式给出的多段履历（改点/换序列号）优先；否则按当前档案补一段初次安装
+            const segments =
+              installations && installations.length > 0
+                ? installations
+                : [
+                    {
+                      id: `inst_${instrumentSeed.id}`,
+                      stationId: instrumentRest.stationId,
+                      serialNo: instrumentRest.serialNo,
+                      startDate: instrumentRest.installDate,
+                      endDate: null,
+                      reason: '初次安装' as const,
+                      operator: '',
+                      remark: '登记仪器时自动生成',
+                    },
+                  ];
+            segments.forEach((segment, segmentIndex) => {
+              const startDate = segment.startDate
+                .replace('__REPLACE_20__', daysAgo(20))
+                .replace('__REPLACE_60__', daysAgo(60));
+              installationRows.push({
+                ...segment,
+                instrumentId: instrumentSeed.id,
+                startDate,
+                ...stamp(baseStamp + segmentIndex + 1),
+              });
             });
             calibrations.forEach((calibrationSeed, calibrationIndex) => {
               const verdict = judgeCalibration(
@@ -537,6 +688,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.installations.bulkPut(installationRows);
     }
   );
 }
@@ -551,11 +703,13 @@ export async function initDatabase(): Promise<void> {
   stampDbVersion();
 }
 
-/** 清空全部业务表（导入覆盖与重置共用） */
+/**
+ * 清空全部业务表（导入覆盖与重置共用）
+ */
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.installations],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +717,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.installations.clear(),
       ]);
     }
   );
@@ -576,14 +731,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, installations] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.installations.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, installations };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

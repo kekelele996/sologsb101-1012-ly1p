@@ -12,22 +12,38 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import type { InstallationRecord } from '@/types/installation';
+import {
+  backfillInstallationsFor,
+  buildReconciliation,
+  calibrationStationAt,
+  groupInstallationsByInstrument,
+  replaceStationAt,
+} from '@/utils/installation';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
-/** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+/** 备份集合键名（installations 为 v3 新增，旧快照缺失时按同一条规则补齐） */
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'installations',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, installations] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.installations.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,10 +54,15 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    installations,
   };
 }
 
-/** 校验外部 JSON 是否为本站可识别的备份文件 */
+/**
+ * 校验外部 JSON 是否为本站可识别的备份文件。
+ * 早期导出的快照没有 installations 表：读回来照「旧数据升级」同一条规则，
+ * 按仪器现有档案（当前台站 + 当前序列号 + 安装日期）补一条履历，幂等可重复导入。
+ */
 export function validateBackup(input: unknown): {
   ok: boolean;
   errors: string[];
@@ -55,19 +76,26 @@ export function validateBackup(input: unknown): {
   if (obj.app !== undefined && obj.app !== 'gbseisarray') {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
-  for (const key of BACKUP_KEYS) {
+  // installations 为 v3 新增表，旧快照允许缺失（下方按规则补齐）
+  for (const key of ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
+  const instruments = obj.instruments ?? [];
+  const rawInstallations: InstallationRecord[] = Array.isArray(obj.installations) ? obj.installations : [];
+  const installations = backfillInstallationsFor(instruments, rawInstallations, {
+    idFactory: (instrumentId) => `inst_bf_${instrumentId}`,
+  });
   const payload: BackupPayload = {
     app: 'gbseisarray',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
     arrays: obj.arrays ?? [],
     stations: obj.stations ?? [],
-    instruments: obj.instruments ?? [],
+    instruments,
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    installations,
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +108,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    installations: payload.installations.length,
   };
 }
 
@@ -117,13 +146,14 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.installations],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.installations.bulkPut(payload.installations);
     }
   );
   return countPayload(payload);
@@ -160,7 +190,13 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const installations = payload.installations.map((row) => ({
+    ...row,
+    id: createId('inst'),
+    instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    stationId: stationMap.get(row.stationId) ?? row.stationId,
+  }));
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, installations };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -184,25 +220,41 @@ export interface ArrayGeometrySummary {
   minSpacingKm: number;
   /** 平均台间距（km） */
   meanSpacingKm: number;
+  /** 按标定日期「当时归属」计入的标定次数 */
   calibrationCount: number;
+  /** 按当前归属硬算的标定次数（与上面的差值即改点带来的口径差异） */
+  calibrationCurrentCount: number;
   unqualifiedCount: number;
   overdueCount: number;
+  /** 按更换单登记日期「当时归属」计入的更换单数 */
+  replaceCount: number;
   pendingReplaceCount: number;
+  /** 当前台站名下仪器中，曾在别的台站装过的台数（改入） */
+  relocatedInCount: number;
+  /** 曾在本台阵台站安装、现已改走的仪器台数（改出） */
+  relocatedOutCount: number;
   conclusion: string;
 }
 
 /** 由快照计算台阵几何与标定结论（供 /geometry 页展示） */
 export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummary[] {
   const today = Date.now();
+  const grouped = groupInstallationsByInstrument(payload.installations);
+  const reconcile = buildReconciliation({
+    stations: payload.stations,
+    instruments: payload.instruments,
+    calibrations: payload.calibrations,
+    replaces: payload.replaces,
+    installations: payload.installations,
+  });
+  const reconcileByStation = new Map(reconcile.rows.map((row) => [row.stationId, row]));
+  const instrumentById = new Map(payload.instruments.map((instrument) => [instrument.id, instrument]));
+
   return payload.arrays.map((array) => {
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
     const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
     const instrumentIds = new Set(instruments.map((instrument) => instrument.id));
-    const calibrations = payload.calibrations.filter((calibration) =>
-      instrumentIds.has(calibration.instrumentId)
-    );
-    const replaces = payload.replaces.filter((replace) => instrumentIds.has(replace.instrumentId));
 
     const points = stations.map((station) => ({
       id: station.id,
@@ -219,11 +271,28 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
         ? 0
         : round(distances.reduce((sum, row) => sum + row.km, 0) / distances.length, 3);
 
-    const unqualifiedCount = calibrations.filter(
+    // 标定成果按「当时归属」：标定当天仪器在哪个台站，成果就算哪个台站（及所属台阵）
+    const calibrationsAtTime = payload.calibrations.filter((calibration) => {
+      const instrument = instrumentById.get(calibration.instrumentId);
+      if (!instrument) return false;
+      return stationIds.has(calibrationStationAt(calibration, instrument, grouped).stationId);
+    });
+    // 若按当前归属硬算会得到的口径，仅用于差异提示
+    const calibrationsCurrent = payload.calibrations.filter((calibration) =>
+      instrumentIds.has(calibration.instrumentId)
+    );
+    // 更换单（含未办完）按登记当天的当时归属留在原台站
+    const replacesAtTime = payload.replaces.filter((replace) => {
+      const instrument = instrumentById.get(replace.instrumentId);
+      if (!instrument) return false;
+      return stationIds.has(replaceStationAt(replace, instrument, grouped).stationId);
+    });
+
+    const unqualifiedCount = calibrationsAtTime.filter(
       (calibration) => calibration.responseVerdict === '不合格'
     ).length;
     const overdueCount = instruments.filter((instrument) => {
-      const rows = calibrations
+      const rows = payload.calibrations
         .filter((calibration) => calibration.instrumentId === instrument.id)
         .sort((a, b) => b.date.localeCompare(a.date));
       const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;
@@ -231,16 +300,27 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       if (!Number.isFinite(lastTime)) return true;
       return today - lastTime > 365 * 86400000;
     }).length;
-    const pendingReplaceCount = replaces.filter((replace) => replace.state !== '已复核').length;
+    const pendingReplaceCount = replacesAtTime.filter((replace) => replace.state !== '已复核').length;
+
+    const relocatedInCount = stations.reduce(
+      (sum, station) => sum + (reconcileByStation.get(station.id)?.relocatedInCount ?? 0),
+      0
+    );
+    const relocatedOutCount = stations.reduce(
+      (sum, station) => sum + (reconcileByStation.get(station.id)?.relocatedOutCount ?? 0),
+      0
+    );
 
     const conclusionParts: string[] = [
-      `${stations.length} 个台站、${instruments.length} 台仪器`,
+      `${stations.length} 个台站、${instruments.length} 台仪器（当前归属）`,
       `实算孔径 ${computed} km`,
-      `累计 ${calibrations.length} 次标定`,
+      `累计 ${calibrationsAtTime.length} 次标定（当时归属）`,
     ];
     if (unqualifiedCount > 0) conclusionParts.push(`${unqualifiedCount} 次标定不合格`);
     if (overdueCount > 0) conclusionParts.push(`${overdueCount} 台超期未标定`);
     if (pendingReplaceCount > 0) conclusionParts.push(`${pendingReplaceCount} 条更换未闭环`);
+    if (relocatedInCount > 0) conclusionParts.push(`${relocatedInCount} 台由其他台站改入`);
+    if (relocatedOutCount > 0) conclusionParts.push(`${relocatedOutCount} 台已改出（历史成果留原站）`);
 
     return {
       arrayId: array.id,
@@ -263,10 +343,14 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
             },
       minSpacingKm,
       meanSpacingKm,
-      calibrationCount: calibrations.length,
+      calibrationCount: calibrationsAtTime.length,
+      calibrationCurrentCount: calibrationsCurrent.length,
       unqualifiedCount,
       overdueCount,
+      replaceCount: replacesAtTime.length,
       pendingReplaceCount,
+      relocatedInCount,
+      relocatedOutCount,
       conclusion: conclusionParts.join('，'),
     };
   });

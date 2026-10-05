@@ -21,18 +21,20 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, HistoryOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
 import StatBadge from '@/components/common/StatBadge';
 import QualifyTag from '@/components/common/QualifyTag';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import InstallationHistoryDrawer from '@/components/common/InstallationHistoryDrawer';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstallations, selectInstruments } from '@/stores/instrumentSlice';
 import {
   bulkSetVerdict,
   createCalibration,
@@ -56,6 +58,7 @@ import {
 import { INSTRUMENT_TYPES, type InstrumentType } from '@/types/instrument';
 import { round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
+import { calibrationStationAt, groupInstallationsByInstrument } from '@/utils/installation';
 
 interface CalibrationFormValues {
   instrumentId: string;
@@ -68,16 +71,23 @@ interface CalibrationFormValues {
   remark: string;
 }
 
-/** 标定行：附带仪器、台站、台阵信息与灵敏度变化 */
+/** 标定行：附带仪器、当时归属台站 / 序列号与灵敏度变化 */
 interface CalibrationRow {
   row: Calibration;
   instrumentModel: string;
   instrumentType: string;
+  /** 标定当天使用的序列号（当时归属） */
   serialNo: string;
+  /** 当前档案序列号（与当时不一致时提示已更换） */
+  currentSerialNo: string;
+  /** 标定当天仪器所在台站码（当时归属） */
   stationCode: string;
+  /** 当前归属台站码（改点后与当时归属不一致） */
+  currentStationCode: string;
   arrayName: string;
   arrayId: string;
   delta: ReturnType<typeof sensitivityDelta>;
+  instrumentId: string;
 }
 
 export default function CalibrationBoard() {
@@ -88,6 +98,7 @@ export default function CalibrationBoard() {
 
   const calibrations = useAppSelector(selectCalibrations);
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
   const filter = useAppSelector(selectCalibrationFilter);
@@ -96,6 +107,7 @@ export default function CalibrationBoard() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const [trendInstrumentId, setTrendInstrumentId] = useState<string | null>(null);
+  const [historyInstrumentId, setHistoryInstrumentId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<CalibrationFormValues>();
 
@@ -151,24 +163,35 @@ export default function CalibrationBoard() {
   }, [calibrations]);
 
   const rows = useMemo<CalibrationRow[]>(() => {
+    const grouped = groupInstallationsByInstrument(installations);
+    const stationCodeOf = (stationId: string): string =>
+      stations.find((station) => station.id === stationId)?.code ?? '—';
     return calibrations
       .map((row) => {
-        const info = instrumentIndex.get(row.instrumentId);
+        const instrument = instruments.find((item) => item.id === row.instrumentId);
+        const atTime = instrument
+          ? calibrationStationAt(row, instrument, grouped)
+          : { stationId: '', serialNo: '' };
+        const station = stations.find((item) => item.id === atTime.stationId);
+        const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
         return {
           row,
-          instrumentModel: info?.model ?? '仪器已删除',
-          instrumentType: info?.type ?? '未知',
-          serialNo: info?.serialNo ?? '—',
-          stationCode: info?.stationCode ?? '—',
-          arrayName: info?.arrayName ?? '—',
-          arrayId: info?.arrayId ?? '',
+          instrumentId: row.instrumentId,
+          instrumentModel: instrument?.model ?? '仪器已删除',
+          instrumentType: instrument?.type ?? '未知',
+          serialNo: atTime.serialNo || '—',
+          currentSerialNo: instrument?.serialNo ?? '',
+          stationCode: stationCodeOf(atTime.stationId),
+          currentStationCode: instrument ? stationCodeOf(instrument.stationId) : '—',
+          arrayName: array?.name ?? '—',
+          arrayId: array?.id ?? '',
           delta: deltaIndex.get(row.id) ?? sensitivityDelta(row.sensitivity, null),
         };
       })
       .filter((item) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
-          const haystack = `${item.instrumentModel}${item.serialNo}${item.stationCode}${item.arrayName}${item.row.operator}${item.row.agency}`;
+          const haystack = `${item.instrumentModel}${item.serialNo}${item.currentSerialNo}${item.stationCode}${item.currentStationCode}${item.arrayName}${item.row.operator}${item.row.agency}`;
           if (!haystack.includes(keyword)) return false;
         }
         if (filter.verdicts.length > 0 && !filter.verdicts.includes(item.row.responseVerdict)) return false;
@@ -177,7 +200,7 @@ export default function CalibrationBoard() {
         return true;
       })
       .sort((a, b) => b.row.date.localeCompare(a.row.date));
-  }, [calibrations, deltaIndex, filter, instrumentIndex]);
+  }, [arrays, calibrations, deltaIndex, filter, installations, instruments, stations]);
 
   const totals = useMemo(() => {
     const unqualified = rows.filter((item) => item.row.responseVerdict === '不合格').length;
@@ -348,6 +371,7 @@ export default function CalibrationBoard() {
           <p className="gb-hint">
             录入灵敏度、自噪与脉冲响应结论，系统按类型灵敏度区间（宽频带 {SENSITIVITY_RANGE.宽频带.min} ~{' '}
             {SENSITIVITY_RANGE.宽频带.max}）与自噪限值（{SELF_NOISE_LIMIT}）自动初判；可勾选批量改结论。
+            标定成果按「当时归属」挂在标定当天的台站与序列号名下，仪器改点或换序列号后旧成果不跟随移动。
           </p>
         </div>
         <Space wrap>
@@ -428,22 +452,40 @@ export default function CalibrationBoard() {
           columns={[
             {
               title: '仪器',
-              width: 200,
+              width: 210,
               render: (_: unknown, item: CalibrationRow) => (
                 <div>
                   <div>
                     {item.instrumentModel} <Tag>{item.instrumentType}</Tag>
                   </div>
-                  <div className="gb-hint gb-mono">{item.serialNo}</div>
+                  <Tooltip
+                    title={
+                      item.currentSerialNo && item.currentSerialNo !== item.serialNo
+                        ? `当前序列号已更换为 ${item.currentSerialNo}，本记录仍挂标定时的旧序列号`
+                        : '标定当时使用的序列号'
+                    }
+                  >
+                    <span className={`gb-mono ${item.currentSerialNo && item.currentSerialNo !== item.serialNo ? 'gb-hint' : ''}`}>
+                      {item.serialNo}
+                      {item.currentSerialNo && item.currentSerialNo !== item.serialNo ? '（旧号）' : ''}
+                    </span>
+                  </Tooltip>
                 </div>
               ),
             },
             {
-              title: '台站 / 台阵',
-              width: 180,
+              title: '当时台站 / 台阵',
+              width: 200,
               render: (_: unknown, item: CalibrationRow) => (
                 <div>
-                  <div className="gb-mono">{item.stationCode}</div>
+                  <div className="gb-mono">
+                    {item.stationCode}
+                    {item.currentStationCode !== item.stationCode ? (
+                      <Tooltip title={`仪器现已改点至 ${item.currentStationCode}，成果仍算原台站`}>
+                        <Tag color="gold" style={{ marginLeft: 6 }}>原站</Tag>
+                      </Tooltip>
+                    ) : null}
+                  </div>
                   <div className="gb-hint">{item.arrayName}</div>
                 </div>
               ),
@@ -502,12 +544,17 @@ export default function CalibrationBoard() {
             { title: '备注', dataIndex: ['row', 'remark'], ellipsis: true },
             {
               title: '操作',
-              width: 190,
+              width: 230,
               render: (_: unknown, item: CalibrationRow) => (
                 <Space size={6}>
                   <Button size="small" onClick={() => setTrendInstrumentId(item.row.instrumentId)}>
                     趋势
                   </Button>
+                  <Tooltip title="查看安装履历（改点 / 换序列号）">
+                    <Button size="small" icon={<HistoryOutlined />} onClick={() => setHistoryInstrumentId(item.instrumentId)}>
+                      履历
+                    </Button>
+                  </Tooltip>
                   <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(item.row)}>
                     编辑
                   </Button>
@@ -660,6 +707,12 @@ export default function CalibrationBoard() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <InstallationHistoryDrawer
+        open={historyInstrumentId !== null}
+        instrumentId={historyInstrumentId}
+        onClose={() => setHistoryInstrumentId(null)}
+      />
     </div>
   );
 }

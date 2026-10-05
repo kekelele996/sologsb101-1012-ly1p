@@ -45,11 +45,12 @@ import {
   syncStationCount,
   updateArray,
 } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectInstallations } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
 import { apertureKm, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
+import { calibrationStationAt, groupInstallationsByInstrument, replaceStationAt } from '@/utils/installation';
 
 interface ArrayFormValues {
   name: string;
@@ -68,6 +69,7 @@ export default function ArrayList() {
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
   const filter = useAppSelector(selectArrayFilter);
@@ -121,23 +123,32 @@ export default function ArrayList() {
     });
   }, [arrays, filter]);
 
-  /** 台阵卡片统计：台站数、仪器数、标定数、不合格数与实算孔径 */
+  /** 台阵卡片统计：台站数与仪器台数按当前归属；标定与更换按当时归属；不合格数与实算孔径 */
   const cards = useMemo(
-    () =>
-      filtered.map((row) => {
+    () => {
+      const grouped = groupInstallationsByInstrument(installations);
+      const instrumentById = new Map(instruments.map((instrument) => [instrument.id, instrument]));
+      const stationArrayMap = new Map(stations.map((station) => [station.id, station.arrayId]));
+      return filtered.map((row) => {
         const arrayStations = stations.filter((station) => station.arrayId === row.id);
         const stationIds = new Set(arrayStations.map((station) => station.id));
         const arrayInstruments = instruments.filter((instrument) => stationIds.has(instrument.stationId));
-        const instrumentIds = new Set(arrayInstruments.map((instrument) => instrument.id));
-        const arrayCalibrations = calibrations.filter((calibration) =>
-          instrumentIds.has(calibration.instrumentId)
-        );
+        // 标定成果按标定当天当时归属台站所属台阵
+        const arrayCalibrations = calibrations.filter((calibration) => {
+          const instrument = instrumentById.get(calibration.instrumentId);
+          if (!instrument) return false;
+          return stationArrayMap.get(calibrationStationAt(calibration, instrument, grouped).stationId) === row.id;
+        });
+        // 更换单按登记当天当时归属台站所属台阵
+        const arrayReplaces = replaces.filter((replace) => {
+          const instrument = instrumentById.get(replace.instrumentId);
+          if (!instrument) return false;
+          return stationArrayMap.get(replaceStationAt(replace, instrument, grouped).stationId) === row.id;
+        });
         const unqualified = arrayCalibrations.filter(
           (calibration) => calibration.responseVerdict === '不合格'
         ).length;
-        const pendingReplace = replaces.filter(
-          (replace) => instrumentIds.has(replace.instrumentId) && replace.state !== '已复核'
-        ).length;
+        const pendingReplace = arrayReplaces.filter((replace) => replace.state !== '已复核').length;
         const computed = apertureKm(
           arrayStations.map((station) => ({
             id: station.id,
@@ -159,8 +170,9 @@ export default function ArrayList() {
               ? 0
               : round(((arrayCalibrations.length - unqualified) / arrayCalibrations.length) * 100, 1),
         };
-      }),
-    [calibrations, filtered, instruments, replaces, stations]
+      });
+    },
+    [calibrations, filtered, installations, instruments, replaces, stations]
   );
 
   const totals = useMemo(

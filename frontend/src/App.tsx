@@ -23,6 +23,7 @@ import {
 } from '@/stores/arraySlice';
 import {
   selectInstruments,
+  selectInstallations,
   startInstrumentSubscription,
 } from '@/stores/instrumentSlice';
 import {
@@ -52,6 +53,7 @@ export default function App() {
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
@@ -127,7 +129,7 @@ export default function App() {
                 <AppstoreOutlined /> 台阵 {arrays.length} · 台站 {stations.length}
               </span>
               <span>
-                <ExperimentOutlined /> 仪器 {instruments.length}
+                <ExperimentOutlined /> 仪器 {instruments.length} · 履历 {installations.length} 段
               </span>
               <span>
                 <ThunderboltOutlined /> 标定 {calibrations.length} · 不合格 {unqualified}

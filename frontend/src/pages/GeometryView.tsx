@@ -26,7 +26,7 @@ import StatBadge from '@/components/common/StatBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstallations, selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import {
   DB_NAME,
@@ -51,8 +51,16 @@ import {
   type CountMap,
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
+import { buildReconciliation } from '@/utils/installation';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  installations: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -60,6 +68,7 @@ export default function GeometryView() {
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
 
@@ -86,13 +95,26 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, installations]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
   const activeStations = useMemo(
     () => stations.filter((station) => station.arrayId === activeArrayId),
     [activeArrayId, stations]
+  );
+
+  /** 布设—计量对账（台站台数按当前归属；标定成果与更换单按当时归属） */
+  const reconciliation = useMemo(
+    () =>
+      buildReconciliation({
+        stations,
+        instruments,
+        calibrations,
+        replaces,
+        installations,
+      }),
+    [calibrations, installations, instruments, replaces, stations]
   );
 
   /** 台阵几何与标定结论汇总 */
@@ -106,9 +128,10 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      installations,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, installations, instruments, replaces, stations]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -233,7 +256,7 @@ export default function GeometryView() {
     const text = summaries
       .map(
         (row) =>
-          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
+          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台（当前归属），登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，标定 ${row.calibrationCount} 次（当时归属）、不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，更换单 ${row.replaceCount} 条、未闭环 ${row.pendingReplaceCount} 条，改入 ${row.relocatedInCount} 台、改出 ${row.relocatedOutCount} 台。`
       )
       .join('\n');
     try {
@@ -284,7 +307,23 @@ export default function GeometryView() {
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="安装履历段" value={counts.installations ?? 0} suffix="段" tone="default" />
       </div>
+
+      <Alert
+        type={reconciliation.balanced ? 'success' : 'error'}
+        showIcon
+        message={
+          reconciliation.balanced
+            ? `布设—计量对账一致：台站台数按当前归属合计 ${reconciliation.totals.instruments} 台；标定成果按当时归属合计 ${reconciliation.totals.calibrations} 次（不合格 ${reconciliation.totals.unqualified} 次）；更换单按登记时归属合计 ${reconciliation.totals.replaces} 条（未办完 ${reconciliation.totals.pendingReplaces} 条）`
+            : '布设—计量对账存在差异'
+        }
+        description={
+          reconciliation.balanced
+            ? '台站合计与仪器档案 / 标定记录 / 更换记录总数逐项相等；改点与换序列号只封存履历段，历史成果留在原台站。'
+            : reconciliation.issues.join('；')
+        }
+      />
 
       {!activeArray || !activeSummary ? (
         <EmptyPanel
@@ -379,14 +418,17 @@ export default function GeometryView() {
                       )}° 方位至首站）`
                     : '—'}
                 </Descriptions.Item>
-                <Descriptions.Item label="累计标定 / 不合格">
-                  {activeSummary.calibrationCount} 次 /{' '}
+                <Descriptions.Item label="累计标定 / 不合格（当时归属）">
+                  {activeSummary.calibrationCount} 次（当前口径 {activeSummary.calibrationCurrentCount} 次） /{' '}
                   <span className={activeSummary.unqualifiedCount > 0 ? 'gb-danger' : ''}>
                     {activeSummary.unqualifiedCount} 次
                   </span>
                 </Descriptions.Item>
                 <Descriptions.Item label="超期未标定 / 未闭环更换">
                   {activeSummary.overdueCount} 台 / {activeSummary.pendingReplaceCount} 条
+                </Descriptions.Item>
+                <Descriptions.Item label="改入 / 改出台数">
+                  {activeSummary.relocatedInCount} / {activeSummary.relocatedOutCount} 台（历史标定与更换单留原站）
                 </Descriptions.Item>
                 <Descriptions.Item label="结论">{activeSummary.conclusion}</Descriptions.Item>
               </Descriptions>
@@ -449,7 +491,26 @@ export default function GeometryView() {
               align: 'right',
               className: 'gb-mono',
             },
-            { title: '累计标定', dataIndex: 'calibrationCount', width: 100, align: 'right', className: 'gb-mono' },
+            { title: '累计标定（当时）', dataIndex: 'calibrationCount', width: 140, align: 'right', className: 'gb-mono',
+              render: (_: unknown, row) => (
+                <span className="gb-mono">
+                  {row.calibrationCount}
+                  {row.calibrationCurrentCount !== row.calibrationCount ? (
+                    <span className="gb-hint">（当前口径 {row.calibrationCurrentCount}）</span>
+                  ) : null}
+                </span>
+              ),
+            },
+            {
+              title: '改入 / 改出',
+              width: 100,
+              align: 'right',
+              render: (_: unknown, row) => (
+                <span className="gb-mono">
+                  {row.relocatedInCount} / {row.relocatedOutCount}
+                </span>
+              ),
+            },
             {
               title: '不合格',
               dataIndex: 'unqualifiedCount',
@@ -467,6 +528,83 @@ export default function GeometryView() {
             { title: '结论', dataIndex: 'conclusion', ellipsis: true },
           ]}
         />
+      </Card>
+
+      <Card
+        className="gb-panel"
+        size="small"
+        title={`布设—计量对账明细（台站口径，共 ${reconciliation.rows.length} 个台站）`}
+      >
+        <Table
+          rowKey="stationId"
+          size="small"
+          className="gb-table-compact"
+          dataSource={reconciliation.rows}
+          pagination={false}
+          locale={{ emptyText: <EmptyPanel title="暂无台站" description="新建台站后自动参与对账。" compact /> }}
+          columns={[
+            {
+              title: '台站',
+              width: 120,
+              render: (_: unknown, row) => (
+                <span className="gb-mono">
+                  {arrays.find((array) => array.id === row.arrayId)?.name ?? '—'} / {row.stationCode}
+                </span>
+              ),
+            },
+            { title: '当前归属台数', dataIndex: 'instrumentCount', width: 120, align: 'right', className: 'gb-mono' },
+            {
+              title: '标定（当时归属）',
+              dataIndex: 'calibrationAtTimeCount',
+              width: 150,
+              align: 'right',
+              render: (_: unknown, row) => (
+                <span className="gb-mono">
+                  {row.calibrationAtTimeCount}
+                  {row.calibrationCurrentCount !== row.calibrationAtTimeCount ? (
+                    <span className="gb-hint">（当前 {row.calibrationCurrentCount}）</span>
+                  ) : null}
+                </span>
+              ),
+            },
+            {
+              title: '不合格（当时）',
+              dataIndex: 'unqualifiedAtTimeCount',
+              width: 130,
+              align: 'right',
+              render: (value: number) => (
+                <span className={value > 0 ? 'gb-danger gb-mono' : 'gb-mono'}>{value}</span>
+              ),
+            },
+            {
+              title: '更换单（当时归属）',
+              dataIndex: 'replaceAtTimeCount',
+              width: 160,
+              align: 'right',
+              render: (_: unknown, row) => (
+                <span className="gb-mono">
+                  {row.replaceAtTimeCount}
+                  <span className="gb-hint">（未办完 {row.pendingReplaceAtTimeCount}）</span>
+                </span>
+              ),
+            },
+            {
+              title: '改入 / 改出',
+              width: 110,
+              align: 'right',
+              render: (_: unknown, row) => (
+                <span className="gb-mono">
+                  {row.relocatedInCount} / {row.relocatedOutCount}
+                </span>
+              ),
+            },
+          ]}
+        />
+        <p className="gb-hint" style={{ marginTop: 8 }}>
+          口径：台站台数按仪器当前 stationId；标定成果按标定日期、更换单按登记日期解析履历段得到当时归属。
+          各列合计分别等于仪器档案 {reconciliation.totals.instruments} 台、标定记录 {reconciliation.totals.calibrations} 次、
+          更换记录 {reconciliation.totals.replaces} 条，即「两边对账对得上」。
+        </p>
       </Card>
 
       <Card className="gb-panel" size="small" title="结构版本与全量 JSON 导入导出">
@@ -504,21 +642,23 @@ export default function GeometryView() {
             <Descriptions.Item label="浏览器记录版本">v{stampedVersion}</Descriptions.Item>
             <Descriptions.Item label="台阵 / 台站">{counts.arrays} / {counts.stations}</Descriptions.Item>
             <Descriptions.Item label="仪器 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
-            <Descriptions.Item label="更换记录">{counts.replaces}</Descriptions.Item>
+            <Descriptions.Item label="更换 / 履历段">{counts.replaces} / {counts.installations ?? 0}</Descriptions.Item>
             <Descriptions.Item label="最近备份时间" span={3}>
               {lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}
             </Descriptions.Item>
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces / installations 六张表；
+            早期五表快照（无 installations）读回来时，按「旧数据升级」同一条规则为每台仪器按现有档案补一条履历。
           </p>
         </Space>
       </Card>
 
-      <p className="gb-hint">
-        提示：孔径按台站两两 Haversine 距离的最大值实算；如需刷新台阵登记孔径，可到「台站仪器」页点击「重算孔径」。
-      </p>
+          <p className="gb-hint">
+            提示：孔径按台站两两 Haversine 距离的最大值实算；如需刷新台阵登记孔径，可到「台站仪器」页点击「重算孔径」。
+            台站台数按当前归属，标定成果与更换单按当时归属，安装履历（v3）保证改点 / 换序列号后两边仍可对账。
+          </p>
     </div>
   );
 }

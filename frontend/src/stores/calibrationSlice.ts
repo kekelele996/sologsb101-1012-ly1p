@@ -13,6 +13,7 @@ import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
+import { buildSegmentTurn } from '@/utils/installation';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -133,7 +134,8 @@ export const updateReplace = createAsyncThunk(
 
 /**
  * 推进更换状态机：
- * 流转到「已更换」时回写仪器序列号并置为在用（更换完成后回写仪器序列号并归档旧记录）。
+ * 流转到「已更换」时回写仪器序列号并置为在用，同时把旧序列号封进安装履历、
+ * 同站开一段新序列号履历（更换单本身不移动，始终留在原台站名下）。
  */
 export const transitionReplace = createAsyncThunk(
   'calibration/transitionReplace',
@@ -147,14 +149,36 @@ export const transitionReplace = createAsyncThunk(
       return rejectWithValue(`状态机不允许从「${replace.state}」流转到「${payload.next}」`);
     }
     const now = Date.now();
-    await db.transaction('rw', [db.replaces, db.instruments], async () => {
+    await db.transaction('rw', [db.replaces, db.instruments, db.installations], async () => {
       await db.replaces.update(payload.id, { state: payload.next, updatedAt: now } as never);
       if (payload.next === '已更换' && replace.newSerialNo) {
+        const instrument = await db.instruments.get(replace.instrumentId);
         await db.instruments.update(replace.instrumentId, {
           serialNo: replace.newSerialNo,
           state: '在用',
           updatedAt: now,
         } as never);
+        if (instrument && replace.newSerialNo !== instrument.serialNo) {
+          const records = await db.installations
+            .where('instrumentId')
+            .equals(replace.instrumentId)
+            .toArray();
+          const turn = buildSegmentTurn(records, {
+            instrumentId: replace.instrumentId,
+            nextStationId: instrument.stationId,
+            nextSerialNo: replace.newSerialNo,
+            startDate: replace.date,
+            reason: '更换序列号',
+            operator: replace.operator,
+            remark: `更换单 ${replace.id} 完成：${replace.reason}`,
+            idFactory: () => createId('inst'),
+            now,
+          });
+          if (turn) {
+            for (const closed of turn.closes) await db.installations.put(closed);
+            await db.installations.bulkPut(turn.opens);
+          }
+        }
       }
     });
     return payload;

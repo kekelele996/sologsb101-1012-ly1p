@@ -112,6 +112,16 @@ body::before {
   padding: 8px 8px !important;
 }
 
+/* 安装履历当前在用段高亮 */
+.gb-row-active > td {
+  background: #f0fbf4 !important;
+}
+
+/* 超期 / 不合格仪器行提醒 */
+.gb-row-danger > td {
+  background: #fdf3f2 !important;
+}
+
 /* 灵敏度趋势图容器 */
 .gb-chart {
   width: 100%;

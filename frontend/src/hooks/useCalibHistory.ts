@@ -5,12 +5,13 @@
 import { useCallback, useMemo } from 'react';
 import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstallations, selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
 import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
 import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
 import type { Instrument } from '@/types/instrument';
+import { calibrationStationAt, groupInstallationsByInstrument } from '@/utils/installation';
 
 /** 单台仪器的标定历史聚合 */
 export interface InstrumentCalibHistory {
@@ -18,6 +19,10 @@ export interface InstrumentCalibHistory {
   stationCode: string;
   arrayId: string;
   arrayName: string;
+  /** 最近一次标定当天仪器所在台站（当时归属，改点后可能与当前台站不同） */
+  latestStationCode: string;
+  /** 最近一次标定当天使用的序列号（当时归属） */
+  latestSerialNo: string;
   /** 历次标定（按日期降序） */
   calibrations: Calibration[];
   /** 最近一次标定 */
@@ -55,9 +60,11 @@ export function useCalibHistory(): UseCalibHistoryResult {
   const arrays = useSelector(selectArrays);
   const stations = useSelector(selectStations);
   const instruments = useSelector(selectInstruments);
+  const installations = useSelector(selectInstallations);
   const calibrations = useSelector(selectCalibrations);
 
   const histories = useMemo<InstrumentCalibHistory[]>(() => {
+    const grouped = groupInstallationsByInstrument(installations);
     return instruments
       .map((instrument) => {
         const station = stations.find((item) => item.id === instrument.stationId);
@@ -72,11 +79,18 @@ export function useCalibHistory(): UseCalibHistoryResult {
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
           return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
         }, '合格');
+        // 最近一次标定的当时归属台站 / 序列号（改点、换序列号后与当前档案可能不同）
+        const latestAttribution = latest
+          ? calibrationStationAt(latest, instrument, grouped)
+          : { stationId: instrument.stationId, serialNo: instrument.serialNo };
+        const latestStation = stations.find((item) => item.id === latestAttribution.stationId);
         return {
           instrument,
           stationCode: station?.code ?? '未知台站',
           arrayId: array?.id ?? station?.arrayId ?? '',
           arrayName: array?.name ?? '未知台阵',
+          latestStationCode: latestStation?.code ?? '未知台站',
+          latestSerialNo: latestAttribution.serialNo,
           calibrations: rows,
           latest,
           delta,
@@ -91,7 +105,7 @@ export function useCalibHistory(): UseCalibHistoryResult {
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, instruments, stations]);
+  }, [arrays, calibrations, installations, instruments, stations]);
 
   const historyOf = useCallback(
     (instrumentId: string): InstrumentCalibHistory | null =>

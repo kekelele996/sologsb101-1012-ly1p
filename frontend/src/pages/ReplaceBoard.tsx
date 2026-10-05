@@ -21,19 +21,27 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, WarningFilled } from '@ant-design/icons';
+import {
+  DeleteOutlined,
+  EditOutlined,
+  HistoryOutlined,
+  PlusOutlined,
+  WarningFilled,
+} from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
 import StatBadge from '@/components/common/StatBadge';
 import QualifyTag from '@/components/common/QualifyTag';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import InstallationHistoryDrawer from '@/components/common/InstallationHistoryDrawer';
 import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstallations, selectInstruments } from '@/stores/instrumentSlice';
 import {
   createReplace,
   patchReplaceFilter,
@@ -55,6 +63,7 @@ import {
 import { daysUntilDue, type Instrument } from '@/types/instrument';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
+import { groupInstallationsByInstrument, replaceStationAt } from '@/utils/installation';
 
 interface ReplaceFormValues {
   instrumentId: string;
@@ -86,6 +95,7 @@ export default function ReplaceBoard() {
   const { message } = AntdApp.useApp();
 
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
   const calibrations = useAppSelector(selectCalibrations);
@@ -95,6 +105,7 @@ export default function ReplaceBoard() {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [historyInstrumentId, setHistoryInstrumentId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplaceFormValues>();
 
@@ -158,16 +169,32 @@ export default function ReplaceBoard() {
   }, [replaces, rows]);
 
   const replaceRows = useMemo(
-    () =>
-      replaces
+    () => {
+      const grouped = groupInstallationsByInstrument(installations);
+      return replaces
         .map((row) => {
           const instrument = instruments.find((item) => item.id === row.instrumentId);
-          const station = instrument ? stations.find((item) => item.id === instrument.stationId) : undefined;
+          // 更换单（含未办完）按登记当天的当时归属留在原台站，不跟随改点移动
+          const atTime = instrument
+            ? replaceStationAt(row, instrument, grouped)
+            : { stationId: '', serialNo: '' };
+          const station = stations.find((item) => item.id === atTime.stationId);
+          const currentStation = instrument
+            ? stations.find((item) => item.id === instrument.stationId)
+            : undefined;
           const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
-          return { row, instrument, stationCode: station?.code ?? '—', arrayName: array?.name ?? '—' };
+          return {
+            row,
+            instrument,
+            stationCode: station?.code ?? '—',
+            currentStationCode: currentStation?.code ?? null,
+            serialAt: atTime.serialNo,
+            arrayName: array?.name ?? '—',
+          };
         })
-        .sort((a, b) => b.row.date.localeCompare(a.row.date)),
-    [arrays, instruments, replaces, stations]
+        .sort((a, b) => b.row.date.localeCompare(a.row.date));
+    },
+    [arrays, installations, instruments, replaces, stations]
   );
 
   const filterModel: FilterModel = {
@@ -464,20 +491,34 @@ export default function ReplaceBoard() {
             columns={[
               {
                 title: '仪器',
-                width: 200,
+                width: 210,
                 render: (_: unknown, item) => (
                   <div>
                     <div>{item.instrument?.model ?? '仪器已删除'}</div>
-                    <div className="gb-hint gb-mono">{item.row.newSerialNo || '未填新序列号'}</div>
+                    <div className="gb-hint gb-mono">
+                      新号 {item.row.newSerialNo || '未填'}
+                      {item.serialAt && item.instrument && item.serialAt !== item.instrument.serialNo ? (
+                        <Tooltip title={`登记更换单时仪器序列号为 ${item.serialAt}`}>
+                          <span> · 原号 {item.serialAt}</span>
+                        </Tooltip>
+                      ) : null}
+                    </div>
                   </div>
                 ),
               },
               {
-                title: '台站 / 台阵',
-                width: 160,
+                title: '原台站 / 台阵',
+                width: 180,
                 render: (_: unknown, item) => (
                   <div>
-                    <div className="gb-mono">{item.stationCode}</div>
+                    <div className="gb-mono">
+                      {item.stationCode}
+                      {item.currentStationCode && item.currentStationCode !== item.stationCode ? (
+                        <Tooltip title={`仪器现已改点至 ${item.currentStationCode}，更换单仍算原台站`}>
+                          <Tag color="gold" style={{ marginLeft: 6 }}>原站</Tag>
+                        </Tooltip>
+                      ) : null}
+                    </div>
                     <div className="gb-hint">{item.arrayName}</div>
                   </div>
                 ),
@@ -496,14 +537,23 @@ export default function ReplaceBoard() {
               { title: '责任人', dataIndex: ['row', 'operator'], width: 100 },
               {
                 title: '操作',
-                width: 280,
+                width: 330,
                 render: (_: unknown, item) => (
-                  <Space size={6}>
+                  <Space size={6} wrap>
                     {(REPLACE_TRANSITIONS[item.row.state] ?? []).map((next) => (
                       <Button key={next} size="small" onClick={() => void advance(item.row, next)}>
                         → {next}
                       </Button>
                     ))}
+                    <Tooltip title="查看安装履历（改点 / 换序列号）">
+                      <Button
+                        size="small"
+                        icon={<HistoryOutlined />}
+                        onClick={() => setHistoryInstrumentId(item.row.instrumentId)}
+                      >
+                        履历
+                      </Button>
+                    </Tooltip>
                     <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(item.row)}>
                       编辑
                     </Button>
@@ -532,7 +582,8 @@ export default function ReplaceBoard() {
       </Card>
 
       <p className="gb-hint">
-        更换完成后点击「→ 已更换」，系统会把新序列号回写到仪器档案并置为在用；再流转到「已复核」即完成闭环。
+        更换完成后点击「→ 已更换」，系统会把新序列号回写到仪器档案并置为在用、旧序列号封进安装履历；
+        再流转到「已复核」即完成闭环。更换单（含未办完的待更换单）始终按登记当天的归属算在原台站名下，仪器改点不影响对账。
         前往
         <Button type="link" size="small" onClick={() => navigate(ROUTES.calibrations)}>
           标定记录台
@@ -604,6 +655,12 @@ export default function ReplaceBoard() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <InstallationHistoryDrawer
+        open={historyInstrumentId !== null}
+        instrumentId={historyInstrumentId}
+        onClose={() => setHistoryInstrumentId(null)}
+      />
     </div>
   );
 }
