@@ -162,7 +162,8 @@ export default function ReplaceBoard() {
       replaces
         .map((row) => {
           const instrument = instruments.find((item) => item.id === row.instrumentId);
-          const station = instrument ? stations.find((item) => item.id === instrument.stationId) : undefined;
+          // 台站归属按登记更换时的台站快照展示，改点后仍按原台站
+          const station = stations.find((item) => item.id === row.stationId);
           const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
           return { row, instrument, stationCode: station?.code ?? '—', arrayName: array?.name ?? '—' };
         })
@@ -211,6 +212,7 @@ export default function ReplaceBoard() {
     try {
       const payload = {
         instrumentId: values.instrumentId,
+        stationId: '',
         reason: values.reason.trim(),
         newSerialNo: values.newSerialNo.trim(),
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),

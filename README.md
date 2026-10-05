@@ -32,7 +32,7 @@ docker compose up -d --build      # 修改代码后重新构建
 | 构建 | Vite 5 | 产物 `dist/`，交给 nginx 托管 |
 | 状态管理 | Redux Toolkit 2 + react-redux 9 | `arraySlice` / `instrumentSlice` / `calibrationSlice` |
 | 路由 | React Router 6（`createBrowserRouter`） | 路径与提示词逐字一致，支持深链刷新 |
-| 持久化 | Dexie 4（IndexedDB，库名 `gbseisarray`） | 结构版本 v2 + upgrade 迁移 + liveQuery 订阅 |
+| 持久化 | Dexie 4（IndexedDB，库名 `gbseisarray`） | 结构版本 v3 + upgrade 迁移 + liveQuery 订阅 |
 | 容器 | node:20-alpine 构建 → nginx:alpine 运行 | 多阶段构建，运行阶段 `chmod -R a+rX` |
 
 ## 三、路由与功能模块
@@ -69,8 +69,8 @@ sologsb101-1012/
     └── src/
         ├── main.tsx            # Provider + ConfigProvider + RouterProvider
         ├── App.tsx             # 侧边导航 + 顶部上下文条 + 页脚，并启动各表订阅
-        ├── types/              # array / station / instrument / calibration / replace / filter
-        ├── stores/             # arraySlice / instrumentSlice / calibrationSlice / store.ts
+        ├── types/              # array / station / instrument / calibration / replace / installHistory / filter
+        ├── stores/             # arraySlice / instrumentSlice / calibrationSlice / installHistorySlice / store.ts
         ├── components/common/  # QualifyTag / FilterBar / StatBadge / EmptyPanel / RouteMissingPanel
         ├── hooks/              # useIdbTable / useCalibHistory
         ├── pages/              # ArrayList / StationInstruments / CalibrationBoard / ReplaceBoard / GeometryView
@@ -91,11 +91,11 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gbseisarray`，当前结构版本 `v2`。读写统一经 `frontend/src/utils/db.ts` 封装，页面组件不直接触碰 Dexie 实例。
-- **数据表**：`arrays`（台阵）、`stations`（台站）、`instruments`（仪器）、`calibrations`（标定）、`replaces`（更换）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与必填字段（孔径、经纬度、高程、基岩、型号、灵敏度、响应结论等）；调整字段结构时递增 `DB_VERSION` 并补迁移。
+- **存储位置**：浏览器 IndexedDB，库名 `gbseisarray`，当前结构版本 `v3`。读写统一经 `frontend/src/utils/db.ts` 封装，页面组件不直接触碰 Dexie 实例。
+- **数据表**：`arrays`（台阵）、`stations`（台站）、`instruments`（仪器）、`calibrations`（标定）、`replaces`（更换）、`installHistories`（安装履历）。
+- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与必填字段（孔径、经纬度、高程、基岩、型号、灵敏度、响应结论等）；`db.version(3).stores(...)` 新增安装履历表，为每台仪器补建首条履历（当前在任，台站与序列号取现有档案），并为标定 / 更换记录补台站归属快照；调整字段结构时递增 `DB_VERSION` 并补迁移。
 - **首屏播种**：`initDatabase()` 在 `arrays` 表为空时执行幂等播种，生成四层互相引用的演示数据（2 个台阵 / 5 个台站 / 8 台仪器 / 14 条标定 / 3 条更换），并刻意包含：1 次不合格标定（自噪超标）、2 台超期未标定仪器、3 条不同状态的更换记录，保证每个页面打开都有内容与可演示的状态。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，`App.tsx` 挂载时启动订阅并把数据 dispatch 到 Redux slice，页面只读 selector。
-- **业务规则**：标定周期 365 天（超期即在更换提醒页高亮）；响应结论自动初判规则为「灵敏度落在类型区间内（宽频带 800~3000、短周期 100~800、强震 0.1~5）且自噪 ≤ 3.5」，最终以标定报告为准；仪器序列号全局唯一；更换状态机为 待更换 → 已更换 → 已复核，流转到「已更换」时把新序列号回写到仪器档案并置为在用。
-- **备份与恢复**：`/geometry` 页可导出包含五张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」；备份时间写入 `localStorage`，页脚与几何页均展示结构版本号。
+- **业务规则**：标定周期 365 天（超期即在更换提醒页高亮）；响应结论自动初判规则为「灵敏度落在类型区间内（宽频带 800~3000、短周期 100~800、强震 0.1~5）且自噪 ≤ 3.5」，最终以标定报告为准；仪器序列号全局唯一；更换状态机为 待更换 → 已更换 → 已复核，流转到「已更换」时把新序列号回写到仪器档案并置为在用；**改点（换台站 / 换序列号）时封存旧台站与旧序列号进安装履历，标定记录与更换单按发生时台站归属记账，台站台数按当前归属数统计，两边对账一致**。
+- **备份与恢复**：`/geometry` 页可导出包含六张表（含安装履历）的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」；旧版快照导入后按现有档案补齐安装履历与台站归属；备份时间写入 `localStorage`，页脚与几何页均展示结构版本号。
 - **离线可用**：应用为纯静态资源，无任何网络请求；换浏览器或清空站点数据后数据不跟随，需通过 JSON 备份迁移。

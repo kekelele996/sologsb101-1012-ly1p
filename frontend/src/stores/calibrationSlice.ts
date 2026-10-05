@@ -13,6 +13,7 @@ import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
+import { sealOpenHistory, openHistory } from '@/utils/installHistory';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -53,6 +54,8 @@ export const createCalibration = createAsyncThunk(
     );
     const row: Calibration = {
       ...payload,
+      // 台站归属按标定发生时仪器所在台站快照，改点后仍按原台站记账
+      stationId: instrument?.stationId ?? payload.stationId ?? '',
       responseVerdict: verdict,
       id: createId('cal'),
       createdAt: now,
@@ -117,7 +120,15 @@ export const createReplace = createAsyncThunk(
   'calibration/createReplace',
   async (payload: Omit<Replace, 'id' | 'createdAt' | 'updatedAt'>) => {
     const now = Date.now();
-    const row: Replace = { ...payload, id: createId('rpl'), createdAt: now, updatedAt: now };
+    const instrument = await db.instruments.get(payload.instrumentId);
+    const row: Replace = {
+      ...payload,
+      // 台站归属按登记更换时仪器所在台站快照，改点后仍按原台站记账
+      stationId: instrument?.stationId ?? payload.stationId ?? '',
+      id: createId('rpl'),
+      createdAt: now,
+      updatedAt: now,
+    };
     await db.replaces.put(row);
     return row;
   }
@@ -147,9 +158,22 @@ export const transitionReplace = createAsyncThunk(
       return rejectWithValue(`状态机不允许从「${replace.state}」流转到「${payload.next}」`);
     }
     const now = Date.now();
-    await db.transaction('rw', [db.replaces, db.instruments], async () => {
+    await db.transaction('rw', [db.replaces, db.instruments, db.installHistories], async () => {
       await db.replaces.update(payload.id, { state: payload.next, updatedAt: now } as never);
       if (payload.next === '已更换' && replace.newSerialNo) {
+        const instrument = await db.instruments.get(replace.instrumentId);
+        if (instrument && instrument.serialNo !== replace.newSerialNo) {
+          // 序列号变更：封存旧履历、开启新履历（台站不变），旧序列号封进履历
+          await sealOpenHistory(instrument.id, replace.date, now);
+          await openHistory(
+            instrument,
+            instrument.stationId,
+            replace.newSerialNo,
+            replace.date,
+            '更换完成回写序列号',
+            now
+          );
+        }
         await db.instruments.update(replace.instrumentId, {
           serialNo: replace.newSerialNo,
           state: '在用',

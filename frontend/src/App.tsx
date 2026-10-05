@@ -30,6 +30,7 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import { startInstallHistorySubscription } from '@/stores/installHistorySlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -67,6 +68,7 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startInstallHistorySubscription(dispatch);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(

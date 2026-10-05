@@ -12,22 +12,24 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import { backfillAttribution, backfillInstallHistories } from '@/utils/installHistory';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces', 'installHistories'] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, installHistories] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.installHistories.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,6 +40,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    installHistories,
   };
 }
 
@@ -56,6 +59,8 @@ export function validateBackup(input: unknown): {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
   for (const key of BACKUP_KEYS) {
+    // installHistories 为 v3 新增字段，旧版快照缺失时允许导入并在导入后补齐
+    if (key === 'installHistories' && obj[key] === undefined) continue;
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
@@ -68,6 +73,7 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    installHistories: obj.installHistories ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +86,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    installHistories: payload.installHistories.length,
   };
 }
 
@@ -117,13 +124,18 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.installHistories],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.installHistories.bulkPut(payload.installHistories);
+      // 旧版快照（无履历 / 无台站归属）按现有档案补齐，与升级迁移同一条规则
+      const now = Date.now();
+      await backfillInstallHistories(now);
+      await backfillAttribution();
     }
   );
   return countPayload(payload);
@@ -154,13 +166,21 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     ...row,
     id: createId('cal'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    stationId: stationMap.get(row.stationId) ?? row.stationId,
   }));
   const replaces = payload.replaces.map((row) => ({
     ...row,
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    stationId: stationMap.get(row.stationId) ?? row.stationId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const installHistories = payload.installHistories.map((row) => ({
+    ...row,
+    id: createId('ih'),
+    instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    stationId: stationMap.get(row.stationId) ?? row.stationId,
+  }));
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, installHistories };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -198,11 +218,11 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
     const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
-    const instrumentIds = new Set(instruments.map((instrument) => instrument.id));
+    // 标定成果按当时归属（台站快照），更换单仍算在原台站名下
     const calibrations = payload.calibrations.filter((calibration) =>
-      instrumentIds.has(calibration.instrumentId)
+      stationIds.has(calibration.stationId)
     );
-    const replaces = payload.replaces.filter((replace) => instrumentIds.has(replace.instrumentId));
+    const replaces = payload.replaces.filter((replace) => stationIds.has(replace.stationId));
 
     const points = stations.map((station) => ({
       id: station.id,
@@ -223,7 +243,8 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       (calibration) => calibration.responseVerdict === '不合格'
     ).length;
     const overdueCount = instruments.filter((instrument) => {
-      const rows = calibrations
+      // 超期评定看仪器的全部标定（跨台站），不受归属变化影响
+      const rows = payload.calibrations
         .filter((calibration) => calibration.instrumentId === instrument.id)
         .sort((a, b) => b.date.localeCompare(a.date));
       const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;

@@ -6,6 +6,7 @@ import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/tool
 import { db, createId, watchTable } from '@/utils/db';
 import type { Instrument, InstrumentDraft, InstrumentState, InstrumentType } from '@/types/instrument';
 import { createEmptyInstrumentDraft, daysUntilDue } from '@/types/instrument';
+import { openHistoryForInstrument, sealOpenHistory, openHistory } from '@/utils/installHistory';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -56,6 +57,8 @@ export const createInstrument = createAsyncThunk(
     await db.instruments.put(row);
     // 登记后自动生成下一次标定待办：待标定状态 + 提示文案
     const dueInDays = daysUntilDue(null, row.installDate);
+    // 首条安装履历：当前在任，台站与序列号取档案
+    await openHistoryForInstrument(row, now);
     return { row, dueInDays };
   }
 );
@@ -72,20 +75,94 @@ export const updateInstrument = createAsyncThunk(
         return rejectWithValue(`序列号「${payload.patch.serialNo}」已被占用`);
       }
     }
-    await db.instruments.update(payload.id, { ...payload.patch, updatedAt: Date.now() } as never);
+    const now = Date.now();
+    const changeDate = new Date(now).toISOString().slice(0, 10);
+    const existing = await db.instruments.get(payload.id);
+    await db.transaction('rw', [db.instruments, db.installHistories], async () => {
+      await db.instruments.update(payload.id, { ...payload.patch, updatedAt: now } as never);
+      // 台站或序列号变化时封存旧履历、开启新履历，旧台站与旧序列号封进履历
+      if (
+        existing &&
+        (payload.patch.stationId !== undefined || payload.patch.serialNo !== undefined)
+      ) {
+        const stationChanged =
+          payload.patch.stationId !== undefined && payload.patch.stationId !== existing.stationId;
+        const serialChanged =
+          payload.patch.serialNo !== undefined && payload.patch.serialNo !== existing.serialNo;
+        if (stationChanged || serialChanged) {
+          const newStationId = payload.patch.stationId ?? existing.stationId;
+          const newSerialNo = payload.patch.serialNo ?? existing.serialNo;
+          const reason =
+            stationChanged && serialChanged
+              ? '台站与序列号调整'
+              : stationChanged
+                ? '台站调整'
+                : '序列号变更';
+          await sealOpenHistory(existing.id, changeDate, now);
+          await openHistory(existing, newStationId, newSerialNo, changeDate, reason, now);
+        }
+      }
+    });
     return payload;
   }
 );
 
-/** 删除仪器：级联删除标定与更换记录 */
+/** 改点：把仪器调整到新台站（可同时换新序列号），旧台站与旧序列号封进履历 */
+export const moveInstrument = createAsyncThunk(
+  'instrument/moveInstrument',
+  async (
+    payload: {
+      instrumentId: string;
+      newStationId: string;
+      newSerialNo?: string;
+      changeDate: string;
+      reason: string;
+    },
+    { rejectWithValue }
+  ) => {
+    const instrument = await db.instruments.get(payload.instrumentId);
+    if (!instrument) return rejectWithValue('仪器不存在');
+    const newSerialNo = payload.newSerialNo?.trim() || instrument.serialNo;
+    if (newSerialNo !== instrument.serialNo) {
+      const conflict = await findSerialConflict(newSerialNo, instrument.id);
+      if (conflict) {
+        return rejectWithValue(`序列号「${newSerialNo}」已被占用`);
+      }
+    }
+    const now = Date.now();
+    await db.transaction('rw', [db.instruments, db.installHistories], async () => {
+      await sealOpenHistory(instrument.id, payload.changeDate, now);
+      await openHistory(
+        instrument,
+        payload.newStationId,
+        newSerialNo,
+        payload.changeDate,
+        payload.reason.trim() || '改点调整',
+        now
+      );
+      await db.instruments.update(
+        instrument.id,
+        { stationId: payload.newStationId, serialNo: newSerialNo, updatedAt: now } as never
+      );
+    });
+    return payload;
+  }
+);
+
+/** 删除仪器：级联删除标定、更换记录与安装履历 */
 export const removeInstrument = createAsyncThunk(
   'instrument/removeInstrument',
   async (instrumentId: string) => {
-    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces], async () => {
-      await db.calibrations.where('instrumentId').equals(instrumentId).delete();
-      await db.replaces.where('instrumentId').equals(instrumentId).delete();
-      await db.instruments.delete(instrumentId);
-    });
+    await db.transaction(
+      'rw',
+      [db.instruments, db.calibrations, db.replaces, db.installHistories],
+      async () => {
+        await db.calibrations.where('instrumentId').equals(instrumentId).delete();
+        await db.replaces.where('instrumentId').equals(instrumentId).delete();
+        await db.installHistories.where('instrumentId').equals(instrumentId).delete();
+        await db.instruments.delete(instrumentId);
+      }
+    );
     return instrumentId;
   }
 );

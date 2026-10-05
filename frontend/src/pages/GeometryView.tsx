@@ -52,7 +52,14 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  installHistories: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -106,6 +113,7 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      installHistories: [],
     };
     return buildArraySummaries(payload);
   }, [arrays, calibrations, instruments, replaces, stations]);
@@ -505,13 +513,15 @@ export default function GeometryView() {
             <Descriptions.Item label="台阵 / 台站">{counts.arrays} / {counts.stations}</Descriptions.Item>
             <Descriptions.Item label="仪器 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
             <Descriptions.Item label="更换记录">{counts.replaces}</Descriptions.Item>
+            <Descriptions.Item label="安装履历">{counts.installHistories}</Descriptions.Item>
             <Descriptions.Item label="最近备份时间" span={3}>
               {lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}
             </Descriptions.Item>
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces / installHistories
+            六张表；旧版快照导入后会按现有档案补齐安装履历与台站归属。
           </p>
         </Space>
       </Card>

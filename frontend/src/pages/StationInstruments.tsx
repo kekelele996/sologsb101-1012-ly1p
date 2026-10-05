@@ -51,6 +51,7 @@ import {
 import {
   bulkSetInstrumentState,
   createInstrument,
+  moveInstrument,
   patchDraft,
   removeInstrument,
   resetDraft,
@@ -59,6 +60,7 @@ import {
   updateInstrument,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectHistoriesOfInstrument } from '@/stores/installHistorySlice';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
@@ -70,6 +72,7 @@ import {
   type InstrumentState,
   type InstrumentType,
 } from '@/types/instrument';
+import { formatHistoryPeriod, type InstallHistory } from '@/types/installHistory';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -122,8 +125,13 @@ export default function StationInstruments() {
   const [editingInstrumentId, setEditingInstrumentId] = useState<string | null>(null);
   const [activeStationId, setActiveStationId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [moveModalOpen, setMoveModalOpen] = useState(false);
+  const [movingInstrument, setMovingInstrument] = useState<Instrument | null>(null);
+  const [historyModalOpen, setHistoryModalOpen] = useState(false);
+  const [historyInstrument, setHistoryInstrument] = useState<Instrument | null>(null);
   const [stationForm] = Form.useForm<StationFormValues>();
   const [instrumentForm] = Form.useForm<InstrumentFormValues>();
+  const [moveForm] = Form.useForm();
 
   useEffect(() => {
     if (arrays.length === 0) void initDatabase();
@@ -136,6 +144,10 @@ export default function StationInstruments() {
 
   const activeInstruments = useAppSelector((state) =>
     selectInstrumentsOfStation(state, activeStationId)
+  );
+
+  const historyRows = useAppSelector((state) =>
+    historyInstrument ? selectHistoriesOfInstrument(state, historyInstrument.id) : []
   );
 
   /** 台站行：附带仪器、标定与超期统计 */
@@ -331,6 +343,45 @@ export default function StationInstruments() {
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const openMove = (instrument: Instrument) => {
+    setMovingInstrument(instrument);
+    moveForm.setFieldsValue({
+      newStationId: undefined,
+      newSerialNo: instrument.serialNo,
+      changeDate: dayjs(),
+      reason: '',
+    });
+    setMoveModalOpen(true);
+  };
+
+  const submitMove = async () => {
+    if (!movingInstrument) return;
+    const values = await moveForm.validateFields();
+    setSubmitting(true);
+    try {
+      await dispatch(
+        moveInstrument({
+          instrumentId: movingInstrument.id,
+          newStationId: values.newStationId,
+          newSerialNo: values.newSerialNo?.trim() || undefined,
+          changeDate: values.changeDate ? values.changeDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+          reason: values.reason?.trim() ?? '',
+        })
+      ).unwrap();
+      message.success('仪器已按新台站归位，旧台站与旧序列号已封入履历');
+      setMoveModalOpen(false);
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '改点失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const openHistory = (instrument: Instrument) => {
+    setHistoryInstrument(instrument);
+    setHistoryModalOpen(true);
   };
 
   const handleBulkPending = async () => {
@@ -653,15 +704,21 @@ export default function StationInstruments() {
                 },
                 {
                   title: '操作',
-                  width: 190,
+                  width: 300,
                   render: (_: unknown, instrument: Instrument) => (
                     <Space size={6}>
                       <Button size="small" onClick={() => openInstrumentEdit(activeStation, instrument)}>
                         编辑
                       </Button>
+                      <Button size="small" onClick={() => openMove(instrument)}>
+                        换台站
+                      </Button>
+                      <Button size="small" onClick={() => openHistory(instrument)}>
+                        履历
+                      </Button>
                       <Popconfirm
                         title="删除仪器"
-                        description={`将同时删除其标定与更换记录，确认删除「${instrument.model}」？`}
+                        description={`将同时删除其标定、更换记录与安装履历，确认删除「${instrument.model}」？`}
                         okText="删除"
                         cancelText="取消"
                         okButtonProps={{ danger: true }}
@@ -785,6 +842,96 @@ export default function StationInstruments() {
             <Input.TextArea rows={2} maxLength={80} placeholder="如：井下安装，深度 42 m" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        open={moveModalOpen}
+        title={`换台站 · ${movingInstrument?.model ?? ''}`}
+        onCancel={() => setMoveModalOpen(false)}
+        onOk={() => void submitMove()}
+        confirmLoading={submitting}
+        okText="确认改点归位"
+        destroyOnClose
+      >
+        <p className="gb-hint" style={{ marginBottom: 12 }}>
+          改点后仪器按新台站归位，旧台站与旧序列号封进安装履历；标定记录与更换单仍算在原台站名下。
+        </p>
+        <Form form={moveForm} layout="vertical" preserve={false}>
+          <Form.Item
+            name="newStationId"
+            label="新台站"
+            rules={[{ required: true, message: '请选择新台站' }]}
+          >
+            <Select
+              showSearch
+              optionFilterProp="label"
+              placeholder="选择要归入的台站"
+              options={stations.map((station) => ({
+                label: `${station.code}（${station.lat.toFixed(4)}, ${station.lng.toFixed(4)}）`,
+                value: station.id,
+              }))}
+            />
+          </Form.Item>
+          <Form.Item name="newSerialNo" label="新序列号（留空则沿用旧序列号）">
+            <Input maxLength={60} placeholder="不换序列号请留空" />
+          </Form.Item>
+          <Row gutter={12}>
+            <Col span={12}>
+              <Form.Item name="changeDate" label="换点日期" rules={[{ required: true }]}>
+                <DatePicker style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="reason" label="换点原因">
+                <Input maxLength={40} placeholder="如：台站调整 / 设备轮换" />
+              </Form.Item>
+            </Col>
+          </Row>
+        </Form>
+      </Modal>
+
+      <Modal
+        open={historyModalOpen}
+        title={`安装履历 · ${historyInstrument?.model ?? ''}（${historyInstrument?.serialNo ?? ''}）`}
+        onCancel={() => setHistoryModalOpen(false)}
+        footer={null}
+        destroyOnClose
+      >
+        {historyRows.length === 0 ? (
+          <EmptyPanel title="暂无履历" description="该仪器还没有安装履历记录。" compact />
+        ) : (
+          <Table
+            rowKey="id"
+            size="small"
+            pagination={false}
+            dataSource={historyRows}
+            columns={[
+              {
+                title: '台站',
+                width: 120,
+                render: (_: unknown, row: InstallHistory) => {
+                  const station = stations.find((item) => item.id === row.stationId);
+                  return <span className="gb-mono">{station?.code ?? '未知台站'}</span>;
+                },
+              },
+              { title: '序列号', dataIndex: 'serialNo', width: 200, render: (v: string) => <span className="gb-mono">{v}</span> },
+              {
+                title: '期间',
+                width: 200,
+                render: (_: unknown, row: InstallHistory) => (
+                  <span className="gb-mono">
+                    {formatHistoryPeriod(row)}
+                    {row.endDate === null ? <Tag color="green" style={{ marginLeft: 8 }}>在任</Tag> : null}
+                  </span>
+                ),
+              },
+              { title: '原因', dataIndex: 'reason', ellipsis: true },
+            ]}
+          />
+        )}
+        <p className="gb-hint" style={{ marginTop: 12 }}>
+          履历按开始日期倒序；改点后旧台站与旧序列号封存于此，当前台站与序列号以仪器档案为准。
+        </p>
       </Modal>
     </div>
   );

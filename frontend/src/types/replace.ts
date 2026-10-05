@@ -15,6 +15,8 @@ export interface Replace {
   id: string;
   /** 被更换仪器 */
   instrumentId: string;
+  /** 登记更换时仪器所属台站（快照：改点后仍按原台站记账） */
+  stationId: string;
   /** 更换原因 */
   reason: string;
   /** 新序列号（更换完成后回写仪器） */

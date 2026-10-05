@@ -154,14 +154,17 @@ export default function CalibrationBoard() {
     return calibrations
       .map((row) => {
         const info = instrumentIndex.get(row.instrumentId);
+        // 台站归属按标定发生时的台站快照展示，改点后仍按原台站
+        const station = stations.find((item) => item.id === row.stationId);
+        const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
         return {
           row,
           instrumentModel: info?.model ?? '仪器已删除',
           instrumentType: info?.type ?? '未知',
           serialNo: info?.serialNo ?? '—',
-          stationCode: info?.stationCode ?? '—',
-          arrayName: info?.arrayName ?? '—',
-          arrayId: info?.arrayId ?? '',
+          stationCode: station?.code ?? '未知台站',
+          arrayName: array?.name ?? '未知台阵',
+          arrayId: array?.id ?? '',
           delta: deltaIndex.get(row.id) ?? sensitivityDelta(row.sensitivity, null),
         };
       })
@@ -177,7 +180,7 @@ export default function CalibrationBoard() {
         return true;
       })
       .sort((a, b) => b.row.date.localeCompare(a.row.date));
-  }, [calibrations, deltaIndex, filter, instrumentIndex]);
+  }, [arrays, calibrations, deltaIndex, filter, instrumentIndex, stations]);
 
   const totals = useMemo(() => {
     const unqualified = rows.filter((item) => item.row.responseVerdict === '不合格').length;
@@ -253,6 +256,7 @@ export default function CalibrationBoard() {
     try {
       const payload = {
         instrumentId: values.instrumentId,
+        stationId: '',
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
         sensitivity: Number(values.sensitivity),
         selfNoise: Number(values.selfNoise),

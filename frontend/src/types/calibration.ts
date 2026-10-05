@@ -8,6 +8,8 @@ export interface Calibration {
   id: string;
   /** 被标定仪器 */
   instrumentId: string;
+  /** 标定发生时仪器所属台站（快照：改点后仍按原台站记账） */
+  stationId: string;
   /** 标定日期 */
   date: string;
   /** 灵敏度（V·s/m） */
